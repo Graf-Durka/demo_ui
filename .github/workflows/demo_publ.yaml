@@ -1,7 +1,14 @@
 name: Trigger Private Demo
 
 on:
+  issue_comment:
+    types: [created]
   workflow_dispatch:
+  
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
 
 env:
   PRIVATE_OWNER: "IAKalash"
@@ -9,11 +16,24 @@ env:
 
 jobs:
   trigger:
+    # Запускаем только если это комментарий в Issue (не PR) и он содержит команду
+    if: github.event.issue.pull_request == null && contains(github.event.comment.body, '/run-demo')
     runs-on: ubuntu-latest
     steps:
+      - name: Подтверждение в комментариях
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "🚀 Команда принята! Запускаю демо... Ожидайте готовности артефактов в этом Workflow."
+            })
+
       - name: Запустить приватный workflow
         run: |
-          echo "Запускаем workflow..."
+          echo "Запускаем workflow в приватном репозитории..."
           curl -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ secrets.PRIVATE_REPO_TOKEN }}" \
@@ -24,45 +44,24 @@ jobs:
       - name: Получить run ID запущенного workflow
         id: get-run
         run: |
-          # Ждём, пока GitHub создаст запись о запуске
           sleep 10
-          
-          # Получаем список последних запусков
           RUNS=$(curl -s -H "Authorization: Bearer ${{ secrets.PRIVATE_REPO_TOKEN }}" \
             "https://api.github.com/repos/${{ env.PRIVATE_OWNER }}/${{ env.PRIVATE_REPO }}/actions/runs?per_page=1")
           
-          # Извлекаем id через jq (надёжно)
           RUN_ID=$(echo "$RUNS" | jq -r '.workflow_runs[0].id // empty')
-          STATUS=$(echo "$RUNS" | jq -r '.workflow_runs[0].status // empty')
-          
-          echo "Найден run_id: $RUN_ID, статус: $STATUS"
-          
-          if [ -z "$RUN_ID" ]; then
-            echo "❌ Не удалось получить run_id"
-            exit 1
-          fi
-          
           echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
 
       - name: Ждать завершения workflow
         id: wait
         run: |
           RUN_ID="${{ steps.get-run.outputs.run_id }}"
-          echo "Ожидание завершения run_id: $RUN_ID"
-          
           for i in {1..40}; do
             sleep 15
             RUNS=$(curl -s -H "Authorization: Bearer ${{ secrets.PRIVATE_REPO_TOKEN }}" \
               "https://api.github.com/repos/${{ env.PRIVATE_OWNER }}/${{ env.PRIVATE_REPO }}/actions/runs/$RUN_ID")
-            
             STATUS=$(echo "$RUNS" | jq -r '.status // empty')
-            CONCLUSION=$(echo "$RUNS" | jq -r '.conclusion // empty')
-            
-            echo "Попытка $i: статус = $STATUS, заключение = $CONCLUSION"
-            
             if [ "$STATUS" = "completed" ]; then
-              echo "✅ Workflow завершён!"
-              echo "conclusion=$CONCLUSION" >> $GITHUB_OUTPUT
+              echo "✅ Завершено!"
               break
             fi
           done
@@ -70,43 +69,32 @@ jobs:
       - name: Скачать артефакты
         run: |
           RUN_ID="${{ steps.get-run.outputs.run_id }}"
-          echo "Скачиваем артефакты для run_id: $RUN_ID"
+          ARTIFACTS=$(curl -s -H "Authorization: Bearer ${{ secrets.PRIVATE_REPO_TOKEN }}" \
+            "https://api.github.com/repos/${{ env.PRIVATE_OWNER }}/${{ env.PRIVATE_REPO }}/actions/runs/$RUN_ID/artifacts")
           
-          for i in {1..20}; do
-            echo "Попытка $i..."
-            
-            ARTIFACTS=$(curl -s -H "Authorization: Bearer ${{ secrets.PRIVATE_REPO_TOKEN }}" \
-              "https://api.github.com/repos/${{ env.PRIVATE_OWNER }}/${{ env.PRIVATE_REPO }}/actions/runs/$RUN_ID/artifacts")
-            
-            ARTIFACT_COUNT=$(echo "$ARTIFACTS" | jq -r '.total_count // 0')
-            
-            if [ "$ARTIFACT_COUNT" -gt 0 ]; then
-              DOWNLOAD_URL=$(echo "$ARTIFACTS" | jq -r '.artifacts[0].archive_download_url // empty')
-              
-              if [ -n "$DOWNLOAD_URL" ]; then
-                echo "Скачиваю с: $DOWNLOAD_URL"
-                curl -L -H "Authorization: Bearer ${{ secrets.PRIVATE_REPO_TOKEN }}" \
-                  -o artifacts.zip "$DOWNLOAD_URL"
-                
-                mkdir -p ./results
-                unzip -o artifacts.zip -d ./results
-                
-                echo "Содержимое results:"
-                ls -la ./results/
-                echo "✅ Артефакты скачаны"
-                exit 0
-              fi
-            fi
-            
-            echo "Артефактов пока нет, жду 10 секунд..."
-            sleep 10
-          done
+          DOWNLOAD_URL=$(echo "$ARTIFACTS" | jq -r '.artifacts[0].archive_download_url // empty')
           
-          echo "❌ Артефакты не найдены"
-          exit 1
+          if [ -n "$DOWNLOAD_URL" ]; then
+            curl -L -H "Authorization: Bearer ${{ secrets.PRIVATE_REPO_TOKEN }}" -o artifacts.zip "$DOWNLOAD_URL"
+            mkdir -p ./results
+            unzip -o artifacts.zip -d ./results
+          fi
 
-      - name: Загрузить артефакт
+      - name: Загрузить артефакт в публичный репозиторий
         uses: actions/upload-artifact@v4
         with:
           name: public-demo-results
           path: ./results
+
+      - name: Финальный статус в комментарий
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = "${{ job.status }}" == "success" ? "✅ Демо успешно завершено! Результаты можно скачать в разделе Actions." : "❌ Произошла ошибка при запуске демо.";
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: status
+            })
